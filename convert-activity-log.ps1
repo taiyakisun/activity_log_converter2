@@ -1,15 +1,73 @@
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
-    [Parameter(Mandatory = $true)]
     [string]$InputJson,
 
-    [string]$TemplateXlsx = 'seikatsu.xlsx',
+    [string]$TemplateXlsx,
 
-    [string]$OutputXlsx
+    [string]$OutputXlsx,
+
+    [string]$NameNo,
+
+    [string]$Name,
+
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$RemainingArguments
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$positionalArguments = [System.Collections.Generic.List[string]]::new()
+$rawArguments = @($RemainingArguments)
+for ($argumentIndex = 0; $argumentIndex -lt $rawArguments.Count; $argumentIndex++) {
+    $argument = $rawArguments[$argumentIndex]
+    switch ($argument.ToLowerInvariant()) {
+        '--nameno' {
+            if (($argumentIndex + 1) -ge $rawArguments.Count) {
+                throw 'The --nameno option requires a value.'
+            }
+
+            $argumentIndex++
+            $NameNo = $rawArguments[$argumentIndex]
+            continue
+        }
+        '--name' {
+            if (($argumentIndex + 1) -ge $rawArguments.Count) {
+                throw 'The --name option requires a value.'
+            }
+
+            $argumentIndex++
+            $Name = $rawArguments[$argumentIndex]
+            continue
+        }
+        default {
+            [void]$positionalArguments.Add($argument)
+        }
+    }
+}
+
+foreach ($argument in $positionalArguments) {
+    if ([string]::IsNullOrWhiteSpace($InputJson)) {
+        $InputJson = $argument
+    }
+    elseif ([string]::IsNullOrWhiteSpace($TemplateXlsx)) {
+        $TemplateXlsx = $argument
+    }
+    elseif ([string]::IsNullOrWhiteSpace($OutputXlsx)) {
+        $OutputXlsx = $argument
+    }
+    else {
+        throw "Unexpected positional argument: $argument"
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($InputJson)) {
+    throw 'InputJson is required.'
+}
+
+if ([string]::IsNullOrWhiteSpace($TemplateXlsx)) {
+    $TemplateXlsx = 'seikatsu.xlsx'
+}
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type -AssemblyName System.Web.Extensions
@@ -447,6 +505,13 @@ function Add-DaySegmentToSlots {
         return
     }
 
+    $nextMidnight = $SegmentStart.Date.AddDays(1)
+    if ($SegmentEnd -gt $nextMidnight) {
+        Add-DaySegmentToSlots -DayState $DayState -SegmentStart $SegmentStart -SegmentEnd $nextMidnight -ActivityType $ActivityType
+        Add-DaySegmentToSlots -DayState $DayState -SegmentStart $nextMidnight -SegmentEnd $SegmentEnd -ActivityType $ActivityType
+        return
+    }
+
     $dayBoundary = $SegmentStart.Date.AddHours(4)
     if ($SegmentStart -lt $dayBoundary -and $SegmentEnd -gt $dayBoundary) {
         Add-DaySegmentToSlots -DayState $DayState -SegmentStart $SegmentStart -SegmentEnd $dayBoundary -ActivityType $ActivityType
@@ -496,26 +561,36 @@ function Add-ActivityToDayMap {
         [string]$ActivityType
     )
 
-    $cursorDate = $Start.Date
-    $lastDate = $End.AddMinutes(-1).Date
+    $availableDates = @($DayMap.Values | ForEach-Object { $_['Date'].Date } | Sort-Object)
+    $firstAvailableDate = $availableDates[0]
+    $lastAvailableDate = $availableDates[-1]
+    $cursor = $Start
 
-    while ($cursorDate -le $lastDate) {
-        $segmentStart = if ($Start -gt $cursorDate) { $Start } else { $cursorDate }
-        $segmentEnd = if ($End -lt $cursorDate.AddDays(1)) { $End } else { $cursorDate.AddDays(1) }
-        if ($segmentEnd -gt $segmentStart) {
-            $dateKey = $cursorDate.ToString('yyyy-MM-dd')
-            if (-not $DayMap.ContainsKey($dateKey)) {
-                throw "Activity '$ActivityType' covers $dateKey, but no matching day entry exists in JSON."
-            }
+    while ($cursor -lt $End) {
+        $recordDate = if ($cursor.TimeOfDay -lt [TimeSpan]::FromHours(4)) {
+            $cursor.Date.AddDays(-1)
+        }
+        else {
+            $cursor.Date
+        }
 
+        $recordBoundary = $recordDate.AddDays(1).AddHours(4)
+        $segmentEnd = if ($End -lt $recordBoundary) { $End } else { $recordBoundary }
+        $dateKey = $recordDate.ToString('yyyy-MM-dd')
+
+        if ($DayMap.ContainsKey($dateKey)) {
             $dayState = $DayMap[$dateKey]
             if ($null -eq $dayState -or $null -eq $dayState['Slots']) {
                 throw "Slot buffer missing for $dateKey"
             }
-            Add-DaySegmentToSlots -DayState $dayState -SegmentStart $segmentStart -SegmentEnd $segmentEnd -ActivityType $ActivityType
+
+            Add-DaySegmentToSlots -DayState $dayState -SegmentStart $cursor -SegmentEnd $segmentEnd -ActivityType $ActivityType
+        }
+        elseif ($recordDate -ge $firstAvailableDate -and $recordDate -le $lastAvailableDate) {
+            throw "Activity '$ActivityType' covers $dateKey, but no matching day entry exists in JSON."
         }
 
-        $cursorDate = $cursorDate.AddDays(1)
+        $cursor = $segmentEnd
     }
 }
 
@@ -881,11 +956,40 @@ function Update-WorksheetData {
         [object[]]$Days,
 
         [Parameter(Mandatory = $true)]
-        [hashtable]$BlackFillStyleIndexes
+        [hashtable]$BlackFillStyleIndexes,
+
+        [string]$NameNo,
+
+        [string]$Name
     )
 
     $worksheetDocument = Load-XmlDocument -Path $WorksheetPath
     $namespaceManager = [System.Xml.XmlNamespaceManager](New-NamespaceManager -Document $worksheetDocument)
+
+    if ($Days.Count -lt 1) {
+        throw "Worksheet $SheetName does not contain any day data."
+    }
+
+    $headerRowNode = $worksheetDocument.SelectSingleNode('/x:worksheet/x:sheetData/x:row[@r=''1'']', $namespaceManager)
+    if (-not $headerRowNode) {
+        throw "Row 1 not found in worksheet $SheetName"
+    }
+
+    $oldestDate = [datetime]$Days[0]['Date']
+    $newestDate = [datetime]$Days[-1]['Date']
+    Set-CellNumber -RowNode $headerRowNode -NamespaceManager $namespaceManager -CellReference 'K1' -Value $oldestDate.Year
+    Set-CellNumber -RowNode $headerRowNode -NamespaceManager $namespaceManager -CellReference 'O1' -Value $oldestDate.Month
+    Set-CellNumber -RowNode $headerRowNode -NamespaceManager $namespaceManager -CellReference 'R1' -Value $oldestDate.Day
+    Set-CellNumber -RowNode $headerRowNode -NamespaceManager $namespaceManager -CellReference 'W1' -Value $newestDate.Month
+    Set-CellNumber -RowNode $headerRowNode -NamespaceManager $namespaceManager -CellReference 'Z1' -Value $newestDate.Day
+
+    if (-not [string]::IsNullOrEmpty($NameNo)) {
+        Set-CellInlineString -RowNode $headerRowNode -NamespaceManager $namespaceManager -CellReference 'AK1' -Value $NameNo
+    }
+
+    if (-not [string]::IsNullOrEmpty($Name)) {
+        Set-CellInlineString -RowNode $headerRowNode -NamespaceManager $namespaceManager -CellReference 'AX1' -Value $Name
+    }
 
     $sheetViewNode = $worksheetDocument.SelectSingleNode('/x:worksheet/x:sheetViews/x:sheetView', $namespaceManager)
     if ($sheetViewNode) {
@@ -1084,7 +1188,7 @@ try {
 
     for ($pageIndex = 0; $pageIndex -lt $pages.Count; $pageIndex++) {
         $worksheetPath = Join-Path -Path $worksheetsDirectory -ChildPath "sheet$($pageIndex + 1).xml"
-        Update-WorksheetData -WorksheetPath $worksheetPath -SheetName $pages[$pageIndex].SheetName -Days $pages[$pageIndex].Days -BlackFillStyleIndexes $blackFillStyleIndexes
+        Update-WorksheetData -WorksheetPath $worksheetPath -SheetName $pages[$pageIndex].SheetName -Days $pages[$pageIndex].Days -BlackFillStyleIndexes $blackFillStyleIndexes -NameNo $NameNo -Name $Name
     }
 
     Write-ZipArchiveFromDirectory -SourceDirectory $expandedWorkbookDirectory -DestinationFile $temporaryOutputPath
